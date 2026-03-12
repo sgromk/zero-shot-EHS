@@ -1,0 +1,47 @@
+name: my_experiment_name          # Used as the run label in output directories
+description: "What this experiment tests"
+
+# ── Model ────────────────────────────────────────────────────────────────────
+# Options: gemini-2.0-flash | gemini-2.5-flash | gemini-2.5-pro
+model: gemini-2.5-flash
+
+# ── Prompt variants ──────────────────────────────────────────────────────────
+# binary_prompt_variant: default | strict   ("animated" is a backward-compat alias for "default")
+binary_prompt_variant: default
+# classification_prompt_variant: default
+classification_prompt_variant: default
+
+# ── Sampling parameters ──────────────────────────────────────────────────────
+temperature: 0.0
+top_k: null          # null = model default
+top_p: null          # null = model default
+
+# ── Stage 1 voting ───────────────────────────────────────────────────────────
+n_votes: 3           # Number of Stage 1 calls per video
+vote_policy: any     # any | majority | all
+
+# ── Confidence gating ────────────────────────────────────────────────────────
+confidence_threshold: 0.6
+
+# ── Frame fallback ───────────────────────────────────────────────────────────
+use_frame_fallback: true
+frame_fallback_fps: 2.0
+frame_fallback_max_frames: 10
+
+# ── Pacing ───────────────────────────────────────────────────────────────────
+sleep_between_videos: 1.0
+
+# ── Dataset source (choose one) ──────────────────────────────────────────────
+# Option A: Spreadsheet (recommended)
+#   Reads dataset_mapping.xlsx; looks for pre-existing VID{n}_* folders in local_videos_dir.
+spreadsheet_source: data/dataset_mapping.xlsx
+local_videos_dir: data/videos
+
+# Option B: Local files only (no spreadsheet)
+# local_videos_dir: data/videos
+# originals_only: true  # false = include augmented versions
+
+# Option C: GCS — set spreadsheet_source and local_videos_dir both to null.
+
+# ── Output ───────────────────────────────────────────────────────────────────
+outputs_dir: outputs

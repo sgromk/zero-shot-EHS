@@ -1,0 +1,43 @@
+name: attempt4_high_recall_gate
+description: >
+  Cost-optimized two-stage pipeline.
+  Stage 1: gemini-2.0-flash-lite with high_recall prompt — maximize recall, minimize cost.
+  Stage 2: gemini-2.5-flash — only runs on videos Stage 1 flags as accidents.
+  Motivation: surveillance footage is highly imbalanced (~99% no accident).
+  Stage 1 must have near-perfect recall; we tolerate false positives since Stage 2 corrects them.
+
+# Stage 1: cheap binary gate — catches everything, low cost
+stage1_model: gemini-2.0-flash-lite
+binary_prompt_variant: high_recall
+
+# Stage 2: full-power classifier — only runs on Stage 1 positives
+model: gemini-2.5-flash
+classification_prompt_variant: default
+
+# Sampling — deterministic Stage 1 (no variance needed, just recall)
+temperature: 0.0
+top_k: null
+top_p: null
+
+# Voting — single vote for Stage 1 to minimize cost
+# "any" policy means even one "accident" vote triggers Stage 2
+n_votes: 1
+vote_policy: any
+
+# Threshold — 0.0 means: any "incident_detected: true" from Stage 1, regardless of confidence,
+# passes to Stage 2. We never want to block a potential accident at the gating stage.
+# Stage 2 will handle false positives. This maximizes Stage 1 recall.
+confidence_threshold: 0.0
+
+# Frame fallback — disabled (Stage 1 model is fast enough)
+use_frame_fallback: false
+frame_fallback_fps: 2.0
+frame_fallback_max_frames: 10
+
+sleep_between_videos: 1.0
+
+spreadsheet_source: data/dataset_mapping.xlsx
+local_videos_dir: data/videos
+originals_only: true
+
+outputs_dir: outputs

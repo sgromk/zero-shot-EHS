@@ -1,0 +1,26 @@
+name: attempt1_baseline
+description: "Basic two-stage pipeline. gemini-2.5-flash, no confidence threshold, 3-vote any policy."
+
+model: gemini-2.5-flash
+binary_prompt_variant: default
+classification_prompt_variant: default
+
+temperature: 0.1
+top_k: null
+top_p: null
+
+n_votes: 3
+vote_policy: any
+confidence_threshold: 0.0
+
+use_frame_fallback: false
+frame_fallback_fps: 2.0
+frame_fallback_max_frames: 10
+
+sleep_between_videos: 1.0
+
+spreadsheet_source: data/dataset_mapping.xlsx
+local_videos_dir: data/videos
+originals_only: true
+
+outputs_dir: outputs

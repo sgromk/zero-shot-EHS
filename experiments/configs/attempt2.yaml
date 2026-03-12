@@ -1,0 +1,26 @@
+name: attempt2_threshold
+description: "Confidence threshold 0.6, strict binary prompt."
+
+model: gemini-2.5-flash
+binary_prompt_variant: strict
+classification_prompt_variant: default
+
+temperature: 0.1
+top_k: null
+top_p: null
+
+n_votes: 3
+vote_policy: any
+confidence_threshold: 0.6
+
+use_frame_fallback: false
+frame_fallback_fps: 2.0
+frame_fallback_max_frames: 10
+
+sleep_between_videos: 1.0
+
+spreadsheet_source: data/dataset_mapping.xlsx
+local_videos_dir: data/videos
+originals_only: true
+
+outputs_dir: outputs

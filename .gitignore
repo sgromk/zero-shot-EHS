@@ -1,0 +1,40 @@
+# ── Personal notes (local only) ──────────────────────────────────────────
+NOTES.md
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+*.json
+!package.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Outputs (results land here but are not committed) ─────────────────────────
+outputs/*/
+!outputs/.gitkeep
+
+# ── Temp video files ──────────────────────────────────────────────────────────
+ytvideos/
+trimmed_videos/
+tmp_vids/
+tmp_frames/
+
+# ── Jupyter checkpoints ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Data files (large; manage separately) ────────────────────────────────────
+data/videos/
+*.xlsx
+*.csv
+!experiments/configs/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
