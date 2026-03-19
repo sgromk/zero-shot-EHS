@@ -15,29 +15,36 @@ import json
 import os
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from pipeline.detection import DetectionResult
-from pipeline.classification import ClassificationResult
+if TYPE_CHECKING:
+    from pipeline.detection import DetectionResult
+    from pipeline.classification import ClassificationResult
 
 
 # ── Token cost estimates (USD per 1K tokens) ─────────────────────────────────
 # Approximate Vertex AI / Google AI pricing — update as pricing changes.
 COST_PER_1K_INPUT_TOKENS: dict[str, float] = {
-    "gemini-2.5-flash":      0.000075,
-    "gemini-2.5-pro":        0.00125,
-    "gemini-2.0-flash":      0.000075,
-    "gemini-2.0-flash-lite": 0.0000375,   # ~half of Flash; used for cheap Stage 1 gate
-    "gemini-1.5-flash":      0.000075,
-    "gemini-1.5-pro":        0.00125,
+    "gemini-2.5-flash":          0.000075,
+    "gemini-2.5-flash-lite":     0.0000375,
+    "gemini-2.5-pro":            0.00125,
+    "gemini-2.0-flash":          0.000075,
+    "gemini-2.0-flash-001":      0.000075,
+    "gemini-2.0-flash-lite":     0.0000375,
+    "gemini-2.0-flash-lite-001": 0.0000375,
+    "gemini-1.5-flash":          0.000075,
+    "gemini-1.5-pro":            0.00125,
 }
 COST_PER_1K_OUTPUT_TOKENS: dict[str, float] = {
-    "gemini-2.5-flash":      0.0003,
-    "gemini-2.5-pro":        0.005,
-    "gemini-2.0-flash":      0.0003,
-    "gemini-2.0-flash-lite": 0.00015,     # ~half of Flash
-    "gemini-1.5-flash":      0.0003,
-    "gemini-1.5-pro":        0.005,
+    "gemini-2.5-flash":          0.0003,
+    "gemini-2.5-flash-lite":     0.00015,
+    "gemini-2.5-pro":            0.005,
+    "gemini-2.0-flash":          0.0003,
+    "gemini-2.0-flash-001":      0.0003,
+    "gemini-2.0-flash-lite":     0.00015,
+    "gemini-2.0-flash-lite-001": 0.00015,
+    "gemini-1.5-flash":          0.0003,
+    "gemini-1.5-pro":            0.005,
 }
 
 
@@ -87,19 +94,23 @@ class ExperimentLogger:
         # Resolve classification fields
         if classification:
             predicted_category = classification.category
+            all_categories = classification.categories
             cls_start = classification.incident_start_time
             cls_end = classification.incident_end_time
             cls_conf = classification.confidence
             description = classification.description
             root_cause = classification.root_cause_analysis
+            ehs_report = classification.ehs_report
             stage2_latency = classification.latency_s
             fallback_used_cat = classification.fallback_used
         else:
             predicted_category = "No Accident"
+            all_categories = [{"category": "No Accident", "confidence": detection.confidence}]
             cls_start = cls_end = None
             cls_conf = detection.confidence
             description = "No accident detected."
             root_cause = "No safety incident observed."
+            ehs_report = {}
             stage2_latency = 0.0
             fallback_used_cat = False
 
@@ -131,12 +142,14 @@ class ExperimentLogger:
             # Classification
             "incident_detected": detection.incident_detected,
             "predicted_category": predicted_category,
+            "all_categories": all_categories,
             "incident_start_time": cls_start,
             "incident_end_time": cls_end,
             "confidence": cls_conf,
             "category_fallback_used": fallback_used_cat,
             "description": description,
             "root_cause_analysis": root_cause,
+            "ehs_report": ehs_report,
             "stage2_latency_s": round(stage2_latency, 3),
             # Totals
             "total_latency_s": round(total_latency, 3),
@@ -215,8 +228,8 @@ class ExperimentLogger:
 # These are rough but consistent across runs — relative comparisons are reliable.
 _STAGE1_INPUT_TOKENS = 800    # video + short binary prompt
 _STAGE1_OUTPUT_TOKENS = 30    # {"incident_detected": true, "confidence": 0.9}
-_STAGE2_INPUT_TOKENS = 1200   # video + longer classification prompt
-_STAGE2_OUTPUT_TOKENS = 200   # full JSON classification response
+_STAGE2_INPUT_TOKENS = 1500   # video + longer structured prompt
+_STAGE2_OUTPUT_TOKENS = 500   # JSON with reasoning, incidents list, EHS report
 
 
 def _estimate_cost(

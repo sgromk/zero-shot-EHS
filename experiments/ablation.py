@@ -67,6 +67,21 @@ BASE_CONFIG: dict[str, Any] = {
 }
 
 
+# ── Phase 3 base config ───────────────────────────────────────────────────────
+# Lock in A_026 sampling (Phase 1 best) as the fixed baseline for Phase 3.
+# Phase 3 groups vary prompt and model — not sampling — so these are held constant.
+
+PHASE3_BASE_CONFIG: dict[str, Any] = {
+    **BASE_CONFIG,
+    "temperature": 0.7,          # A_026 best
+    "top_p": 0.95,
+    "top_k": 40,
+    "n_votes": 3,
+    "vote_policy": "any",
+    "confidence_threshold": 0.0,
+}
+
+
 # ── Study group definitions ───────────────────────────────────────────────────
 #
 # Each group is a dict of axis → list[values].
@@ -126,7 +141,7 @@ STUDY_GROUPS: dict[str, dict[str, list[Any]]] = {
     "E": {
         "stage1_model": [
             "gemini-2.5-flash",
-            "gemini-2.0-flash-lite",   # cheapest — is it good enough for gating?
+            "gemini-2.5-flash-lite",   # cheaper — is it good enough for gating?
         ],
         "model": [
             "gemini-2.5-flash",
@@ -145,12 +160,37 @@ STUDY_GROUPS: dict[str, dict[str, list[Any]]] = {
     #
     # Metric to watch: Stage 1 recall (must stay near 1.0), cost per video.
     "F": {
-        "stage1_model":            ["gemini-2.0-flash-lite", "gemini-2.5-flash"],
+        "stage1_model":            ["gemini-2.5-flash-lite", "gemini-2.5-flash"],
         "binary_prompt_variant":   ["high_recall"],
         "model":                   ["gemini-2.5-flash"],
         "confidence_threshold":    [0.0, 0.3],  # Low threshold → maximize recall
         "n_votes":                 [1, 3],       # n_votes=1 → cheapest Stage 1
         "use_frame_fallback":      [False],      # Explicit: never re-check non-accidents
+    },
+
+    # ── Phase 3 groups ────────────────────────────────────────────────────────
+    # These use PHASE3_BASE_CONFIG (A_026 sampling locked in) rather than BASE_CONFIG.
+    # Run via run_phase3_sweep(), not run_full_phased_sweep().
+
+    # ── Group G: Prompt quality re-evaluation ─────────────────────────────────
+    # The structured classification prompt was silently broken in Phase 1 (missing
+    # dict key — all "structured" configs fell back to default). Now that it works,
+    # re-run the full binary × classification prompt grid with best sampling.
+    # Metric to watch: Vehicle Incident F1 (was 0.000 in Phase 1), macro_F1.
+    "G": {
+        "binary_prompt_variant":         ["default", "strict", "high_recall"],
+        "classification_prompt_variant": ["default", "structured"],
+    },
+
+    # ── Group H: Model tier with CoT prompting ────────────────────────────────
+    # Phase 1 Group E found Pro was worse than Flash (macro_F1 0.550 vs 0.626),
+    # but that was with the broken/default prompt. CoT reasoning may now justify
+    # Pro's cost. Also re-tests flash-lite as Stage 1 gate.
+    # Metric to watch: macro_F1 vs total_cost_usd — does Pro pay off?
+    "H": {
+        "stage1_model":                  ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        "model":                         ["gemini-2.5-flash", "gemini-2.5-pro"],
+        "classification_prompt_variant": ["structured"],
     },
 }
 
@@ -351,6 +391,7 @@ def _print_diff(cfg: dict[str, Any]) -> None:
 def run_phase1_sweep(
     outputs_dir: str = "outputs",
     max_configs_per_group: int | None = None,
+    base_config: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     """
     Phase 1: Run all 6 study groups over the 73 original videos.
@@ -366,6 +407,7 @@ def run_phase1_sweep(
         print(f"\n{'─'*60}")
         dirs = run_study_group(
             group_id,
+            base_config=base_config,
             max_configs=max_configs_per_group,
             outputs_dir=outputs_dir,
             name_prefix=f"phase1_{group_id}",
@@ -484,7 +526,9 @@ def run_phase2_augmented(
         # Strip any Phase 1 prefix and add phase2 marker
         run_name = f"phase2_{run_name.lstrip('phase1_')}"
 
-        aug_cfg = dict(cfg)
+        # Merge with BASE_CONFIG so spreadsheet_source / local_videos_dir are
+        # always present even if config_snapshot.yaml was missing or incomplete.
+        aug_cfg = {**BASE_CONFIG, **cfg}
         aug_cfg["augmented_only"] = True
         aug_cfg["originals_only"] = False  # ensure augmented_only takes precedence
         aug_cfg["name"] = run_name
@@ -504,6 +548,7 @@ def run_full_phased_sweep(
     n_top: int = 5,
     outputs_dir: str = "outputs",
     max_configs_per_group: int | None = None,
+    base_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Full two-phase ablation sweep.
@@ -530,6 +575,7 @@ def run_full_phased_sweep(
     phase1_dirs_by_group = run_phase1_sweep(
         outputs_dir=outputs_dir,
         max_configs_per_group=max_configs_per_group,
+        base_config=base_config,
     )
     all_phase1_dirs = [d for dirs in phase1_dirs_by_group.values() for d in dirs]
 
@@ -550,6 +596,66 @@ def run_full_phased_sweep(
     }
 
 
+# ── Phase 3 sweep ─────────────────────────────────────────────────────────────
+
+def run_phase3_sweep(
+    outputs_dir: str = "outputs",
+    max_configs_per_group: int | None = None,
+) -> dict[str, Any]:
+    """
+    Phase 3 ablation sweep — prompt engineering and model tier re-evaluation.
+
+    Builds on Phase 1/2 findings:
+    - Locks in A_026 sampling (temp=0.7, top_p=0.95, top_k=40) as the base
+    - Group G: re-evaluates binary × classification prompt grid with working structured prompt
+    - Group H: re-tests model tier (flash vs Pro) with CoT structured prompt
+
+    After G+H, carries the best 3 Pareto configs onto augmented videos.
+
+    Returns a dict with keys "G", "H", "selected_configs", "augmented".
+    """
+    print(f"\n{'='*60}")
+    print("PHASE 3 — Prompt & model re-evaluation (G → H → augmented)")
+    print(f"{'='*60}")
+
+    # Group G
+    print(f"\n{'─'*60}")
+    g_dirs = run_study_group(
+        "G",
+        base_config=PHASE3_BASE_CONFIG,
+        max_configs=max_configs_per_group,
+        outputs_dir=outputs_dir,
+        name_prefix="phase3_G",
+    )
+
+    # Group H
+    print(f"\n{'─'*60}")
+    h_dirs = run_study_group(
+        "H",
+        base_config=PHASE3_BASE_CONFIG,
+        max_configs=max_configs_per_group,
+        outputs_dir=outputs_dir,
+        name_prefix="phase3_H",
+    )
+
+    all_dirs = g_dirs + h_dirs
+    print(f"\n{'='*60}")
+    print("PHASE 3 COMPLETE — Selecting best configs for augmented validation")
+    print(f"{'='*60}")
+    compare_results(all_dirs)
+
+    selected = select_best_configs(all_dirs, n=3, include_pareto=True)
+
+    aug_dirs = run_phase2_augmented(selected, outputs_dir=outputs_dir)
+
+    return {
+        "G": g_dirs,
+        "H": h_dirs,
+        "selected_configs": selected,
+        "augmented": aug_dirs,
+    }
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -558,6 +664,14 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     smoke = "--smoke" in args
     outputs = "outputs"
+
+    # --phase3  → run Phase 3 sweep (Groups G + H + augmented validation)
+    if "--phase3" in args:
+        run_phase3_sweep(
+            outputs_dir=outputs,
+            max_configs_per_group=1 if smoke else None,
+        )
+        sys.exit(0)
 
     # --group X  → run a single study group
     if "--group" in args:

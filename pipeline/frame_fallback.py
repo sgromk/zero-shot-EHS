@@ -14,7 +14,10 @@ import subprocess
 import time
 from pathlib import Path
 
-from vertexai.generative_models import GenerativeModel, Part
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vertexai.generative_models import GenerativeModel, Part
 
 from config.settings import config
 from pipeline.client import vertex_model
@@ -104,6 +107,8 @@ def classify_frame(
     Classify a single frame as accident (True) or not (False).
     """
     _model = model or vertex_model
+
+    from vertexai.generative_models import Part
 
     with open(frame_path, "rb") as f:
         img_bytes = f.read()

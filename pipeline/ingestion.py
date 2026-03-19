@@ -5,11 +5,16 @@ Video ingestion helpers:
 - (Optional) Download + trim from YouTube using yt-dlp + moviepy
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
 from pathlib import Path
 
-from google.cloud.storage import Blob
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from google.cloud.storage import Blob
 
 from config.settings import config
 from pipeline.client import gcs_bucket

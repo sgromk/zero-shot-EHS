@@ -13,7 +13,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from vertexai.generative_models import GenerativeModel, Part
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vertexai.generative_models import GenerativeModel, Part
 
 from config.settings import config
 from pipeline.client import vertex_model

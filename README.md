@@ -1,277 +1,145 @@
-# EHS Video Analysis — Capstone Pipeline
+# EHS Video Analysis — Workplace Safety Incident Detection
 
-Zero-shot and few-shot video classification pipeline for workplace safety incident detection using Google Vertex AI (Gemini 2.5 Flash).
+A two-stage zero-shot video classification pipeline for 24/7 workplace safety surveillance using Google Gemini 2.5 via Vertex AI. The system detects accidents in surveillance footage and generates structured EHS incident reports without any fine-tuning or labelled training data.
 
----
-
-## Project Structure
-
-```
-Capstone/
-├── config/               # Categories, severity, global settings
-├── pipeline/             # Core inference modules
-│   ├── client.py         # Vertex AI + GCS init (lazy GCS client)
-│   ├── ingestion.py      # Local video sourcing + spreadsheet loader
-│   ├── detection.py      # Stage 1: binary accident detection
-│   ├── classification.py # Stage 2: incident type classification
-│   ├── postprocessing.py # JSON parsing, normalization, retry
-│   ├── frame_fallback.py # ffmpeg frame extraction fallback
-│   ├── structured_output.py # Decomposed component classification
-│   └── near_miss.py      # Three-class: accident / near-miss / safe
-├── experiments/          # Orchestration, sampling, ablation
-│   ├── runner.py         # Main batch runner (reads YAML config)
-│   ├── sampling.py       # Top-k/p probabilistic sweeps
-│   ├── multi_agent.py    # Three-agent judge/jury pipeline
-│   ├── ablation.py       # 6-group ablation + phased sweep orchestration
-│   └── configs/          # YAML configs: attempt1–4 + ablation_grid
-├── evaluation/           # Metrics, confusion analysis, plots
-│   ├── metrics.py        # Binary + multiclass metrics, GT loader
-│   ├── visualize.py      # generate_report() → single PDF output
-│   ├── confusion.py      # Failure diagnostics (FP/FN analysis)
-│   └── ehs_report.py     # OSHA category mapping, EHS report builder
-├── run_logging/          # Per-video JSONL logger + cost estimator
-├── notebooks/            # Reference + analysis notebooks
-├── data/
-│   ├── dataset_mapping.xlsx  # Ground truth (gitignored)
-│   └── videos/               # Local dataset (gitignored)
-│       └── VID{n}_<label>/
-│           ├── original.mp4
-│           ├── meta.json
-│           ├── type1/    (augmented .mp4 files)
-│           └── type2/    (augmented .mp4 files)
-└── outputs/              # Experiment results (gitignored)
-    └── <timestamp>_<run_id>/
-        ├── predictions.jsonl
-        ├── metrics.json      # binary_f1, macro_f1, per_class_f1, cost, latency
-        ├── failed_videos.csv
-        └── report.pdf
-```
+For full experimental results see [FINDINGS.md](FINDINGS.md).
 
 ---
 
-## Setup
+## Why Two Stages
 
-### 1. Install dependencies
-```bash
-pip install -r requirements.txt
-sudo apt install ffmpeg   # or: brew install ffmpeg on macOS
-```
+Surveillance footage has an approximately 1% accident rate in active industrial environments. A single-stage classifier would spend 99% of its budget on non-accident clips. The pipeline is explicitly designed around this asymmetry:
 
-### 2. Configure environment
-```bash
-cp .env.example .env
-# Edit .env — fill in your GCP credentials and paths
-```
+- **Stage 1** is cheap and aggressive — a short binary prompt asking only "is there an accident?" runs on every clip. Optimised for recall. Non-accident clips stop here with one API call.
+- **Stage 2** is thorough and expensive — a longer structured prompt classifying incident type, reasoning through the scene, and generating an EHS report. Runs only on Stage 1 positives (~1% of clips in deployment). Its per-call cost is effectively negligible at scale.
 
-Required `.env` variables:
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_APPLICATION_CREDENTIALS` | Absolute path to service account JSON key |
-| `GCP_PROJECT_ID` | GCP project ID (`ehs-incident-detection-blissey`) |
-| `GCS_BUCKET_NAME` | GCS bucket name (leave blank if using local mode) |
-| `LOCAL_GROUND_TRUTH` | Path to `data/dataset_mapping.xlsx` |
-
-### 3. Dataset structure
-
-Videos live under `data/videos/`, one folder per clip, 0-indexed and zero-padded:
-
-```
-data/videos/
-├── VID000_<title>/
-│   ├── original.mp4
-│   ├── meta.json
-│   ├── type1/    (augmented clips)
-│   └── type2/    (augmented clips)
-├── VID001_<title>/
-...
-└── VID072_<title>/
-```
-
-Ground truth: `data/dataset_mapping.xlsx` — 73 rows, columns:
-`video_url`, `start_s`, `end_s`, `duration_s`, `incident_present`,
-`near_miss_present`, `accident_present`, `incident_severity`, `incident_type`, `description`.
+This keeps the dominant cost as a single cheap Stage 1 call per clip, while delivering rich classification and reporting on the small fraction that matters.
 
 ---
 
-## Running Experiments
+## Key Modules
 
-### Single experiment
-```bash
-# Run a specific experiment config
-python -m experiments.runner experiments/configs/attempt2.yaml
+### `pipeline/detection.py` — Stage 1 binary gate
 
-# Auto-detect the next attempt (scans outputs/ for highest attempt{n})
-python -m experiments.runner --next
-```
+Implements `detect()`, which fires N independent Gemini Flash calls on a video and aggregates them by vote policy (`any` / `majority` / `all`). The `n_votes` parameter enables majority-vote ensembling; votes run in parallel via `ThreadPoolExecutor`. Parallelising within a single clip allows higher n_votes without adding wall-clock latency.
 
-After each run, `metrics.json` is automatically populated with binary_f1, macro_f1, per_class_f1, cost, and latency (requires `spreadsheet_source` to be set in the config).
+Three binary prompt variants are defined:
+- `default` — balanced, flags any physical impact or consequence to a person
+- `high_recall` — aggressive, instructs the model to flag any ambiguity and let Stage 2 decide; preferred for production
+- `strict` — conservative, requires clear evidence of physical harm; useful for low-false-positive environments
 
-### Ablation sweep — phased approach
+### `pipeline/classification.py` — Stage 2 classifier and EHS report
 
-Phase 1 sweeps all 64 configs over the 73 originals. Phase 2 runs the best-performing configs on augmented videos.
+Implements `classify()`, which calls Gemini Flash with the structured prompt and parses the response. Returns a `ClassificationResult` containing:
+- `category` — primary (highest-confidence) incident type
+- `categories` — full ranked list of predicted types with confidence scores (multi-label)
+- `ehs_report` — structured dict with severity, immediate actions, root cause, contributing factors, corrective measures
+- `incident_start_time` / `incident_end_time`, `description`, `raw_response`
 
-```python
-# Full two-phase sweep (recommended)
-from experiments.ablation import run_full_phased_sweep
-run_full_phased_sweep(n_top=5)
+The `structured` prompt uses a three-step chain-of-thought: observe the scene → classify all applicable types above 0.5 confidence → generate EHS report. The `default` prompt is single-label, returning one category with no EHS report.
 
-# Smoke test — 1 config per group, skips nothing
-run_full_phased_sweep(n_top=3, max_configs_per_group=1)
+Response parsing handles both old single-label format (for backward compat with baseline runs) and the new multi-label `incidents` list format.
 
-# Run phases independently
-from experiments.ablation import run_phase1_sweep, select_best_configs, run_phase2_augmented
+### `pipeline/ingestion.py` — video sourcing
 
-phase1 = run_phase1_sweep()                            # C → D → F → B → A → E
-all_dirs = [d for dirs in phase1.values() for d in dirs]
-best = select_best_configs(all_dirs, n=5)              # top-N + Pareto front
-run_phase2_augmented(best)                             # type1/ + type2/ videos
+Loads video clips from local disk under `data/videos/VID{n}_{title}/`. Each VID folder contains `original.mp4` plus `type1/` and `type2/` subdirectories of augmented variants. The `originals_only` / `augmented_only` config flags control which subset is loaded. Returns `Part` objects ready for the Vertex AI API.
 
-# Run a single group
-from experiments.ablation import run_study_group
-run_study_group('C')
-```
+### `pipeline/postprocessing.py` — parsing and retry
 
-### Compare results across runs
-```python
-from experiments.ablation import compare_results
-compare_results(["outputs/phase1_C_000", "outputs/phase1_C_001", ...])
-# Prints: BinF1 | MacF1 | BinRec | BinPre | Lat(s) | Cost($) | weak-category F1s
-```
+`safe_parse_json()` handles malformed JSON in model responses (strips markdown fences, attempts partial parse). `generate_with_retry()` wraps API calls with exponential backoff on 429 rate-limit errors.
 
-### Generate a PDF report
-```python
-from evaluation.visualize import generate_report
-generate_report(
-    'outputs/<timestamp>_attempt2/predictions.jsonl',
-    'data/dataset_mapping.xlsx',
-    'outputs/<timestamp>_attempt2/report.pdf',
-    run_id='attempt2',
-)
-```
+### `experiments/ablation.py` — sweep orchestration
+
+Defines 8 study groups (A–H), each as a Cartesian product of parameter axes. `generate_configs()` expands any group into a flat list of configs. `run_study_group()` runs them sequentially, `compare_results()` prints a metric table. `run_phase1_sweep()` runs groups C→D→F→B→A→E in cost-impact order. `select_best_configs()` applies Pareto selection on (binary_F1, cost) and feeds into `run_phase2_augmented()` / `run_phase3_sweep()`.
+
+### `experiments/runner.py` — single experiment
+
+`ExperimentRunner` takes a config dict, loads videos, runs Stage 1 on all of them (parallelised by `max_workers`), runs Stage 2 only on positives, logs every prediction to JSONL, and calls `evaluation.metrics.evaluate()` at the end to write binary_F1, macro_F1, per_class_F1, cost, and latency into `metrics.json`.
+
+### `evaluation/metrics.py` — evaluation
+
+Loads ground truth from `dataset_mapping.xlsx` and predictions from `predictions.jsonl`, merges on VID key, and computes binary metrics (F1, precision, recall) and multiclass metrics (macro_F1, per-class F1). Also computes `any_match_recall` for multi-label runs: the fraction of accident clips where the ground-truth category appears anywhere in the predicted `categories` list.
+
+### `run_logging/experiment_logger.py` — per-video logging
+
+Thread-safe logger that appends one JSON record per video to `predictions.jsonl` immediately after inference, so partial runs are always recoverable. Estimates API cost using per-token Vertex AI pricing with separate rates for Stage 1 and Stage 2 models.
 
 ---
 
-## Experiment Configs
+## Ablation Study Design
 
-| Config | Description | Status |
-|---|---|---|
-| `attempt1.yaml` | Baseline — default prompt, originals only, no threshold | ✅ Done — binary F1=0.889, macro F1=0.681 |
-| `attempt2.yaml` | Strict prompt, confidence threshold 0.6 | Planned |
-| `attempt3.yaml` | Default prompt + frame fallback (10 frames @ 2 fps) | Planned |
-| `attempt4_high_recall_gate.yaml` | Flash-Lite Stage 1 gate + high-recall prompt → Flash Stage 2 | Planned |
-| `ablation_grid.yaml` | Full parameter space reference + group definitions | Reference |
-| `experiment_template.yaml` | Fully documented template with all options | Reference |
+### Parameter Axes and Group Assignments
 
----
+The ablation study is structured to vary one axis at a time, holding others at a principled baseline. Groups are run in cheapest/highest-impact order.
 
-## Pipeline Design
-
-### Two-stage inference
-
-```
-Every video
-    │
-    ▼
-Stage 1 (binary gate)
-    model:  stage1_model   (default: gemini-2.5-flash, or gemini-2.0-flash-lite for cost opt.)
-    prompt: binary_prompt_variant  (default | strict | high_recall)
-    calls:  n_votes  (1–5 independent calls, combined by vote_policy)
-    │
-    ├─ "No Accident" ──→ STOP. Log prediction. No Stage 2 call.
-    │                    (single-pass: critical for 99%-negative real-world footage)
-    │
-    └─ "Accident" ─────→ Stage 2 (classifier)
-                            model:  model  (gemini-2.5-flash)
-                            prompt: classification_prompt_variant
-                            output: incident category + timing + RCA
-```
-
-### Cost optimization (single-pass for non-accidents)
-
-In real surveillance deployment, ~99% of footage has no accident. The pipeline is designed so non-accident clips receive exactly **one cheap Stage 1 call** and stop. Accident clips receive Stage 1 + Stage 2.
-
-Key config for cost optimization:
-- `stage1_model: gemini-2.0-flash-lite` — cheapest model for gating
-- `binary_prompt_variant: high_recall` — aggressive: flags any ambiguity, never misses a real accident
-- `n_votes: 1` — single Stage 1 call per video (eliminates ensemble overhead on non-accidents)
-- `use_frame_fallback: false` — frame fallback re-checks Stage 1 negatives; disable for cost opt.
-- `confidence_threshold: 0.0` — pass all Stage 1 positives to Stage 2 (no additional gating)
-
-Stage 1 recall must stay ≥ 0.97. Stage 1 precision is irrelevant — Stage 2 corrects false positives.
-
----
-
-## Ablation Studies
-
-Six study groups, 64 total configurations. Run in the order below (cheapest/most-impactful first):
-
-| Order | Group | Axes | Configs | Key metric |
-|---|---|---|---|---|
-| 1 | **C** | binary_prompt × classification_prompt | 6 | binary_f1, macro_f1 |
-| 2 | **D** | confidence_threshold × binary_prompt | 10 | binary_recall, cost |
-| 3 | **F** | stage1_model × threshold × n_votes (high_recall, no fallback) | 8 | Stage 1 recall, cost |
-| 4 | **B** | n_votes × vote_policy (temp=0.3 fixed) | 9 | binary_recall, cost |
-| 5 | **A** | temperature × top_p × top_k | 27 | binary_f1, latency |
-| 6 | **E** | stage1_model × model | 4 | recall (Stage 1), macro_f1 (Stage 2) |
-
-`SWEEP_ORDER = ["C", "D", "F", "B", "A", "E"]` is enforced by `run_phase1_sweep()`.
-
-### Config isolation rules
-- **A**: keep n_votes=3, prompt=default, threshold=0.0
-- **B**: keep temperature=0.3 (temp=0 makes all votes identical)
-- **C**: keep temperature=0.1, n_votes=3, threshold=0.0
-- **D**: use best binary_prompt from Group C
-- **E**: fix everything else, vary only model tiers
-- **F**: binary_prompt fixed to `high_recall`; `use_frame_fallback` fixed to `False`
-
-### Phase 2 — Augmented videos
-
-After Phase 1 identifies the top configs, `run_phase2_augmented()` reruns them on `type1/` and `type2/` augmented variants. Ground truth is matched by stripping the augmented suffix from the video ID (e.g., `VID042_type1_aug_bright` → `VID042`).
-
-Use `augmented_only: true` in a YAML config to run augmented videos only without re-running originals.
-
----
-
-## Output Format
-
-Each run writes to `outputs/<timestamp>_<run_id>/`:
-
-| File | Description |
-|---|---|
-| `predictions.jsonl` | Per-video predictions: stage1/stage2 latency, estimated cost, votes, category |
-| `failed_videos.csv` | Videos that errored out |
-| `metrics.json` | Full metrics: binary_f1, macro_f1, per_class_f1, binary_recall, binary_precision, cost, latency |
-| `report.pdf` | Metrics table + binary CM + multiclass CM |
-
-Cost is estimated per-video as: `n_votes × stage1_cost + (stage2_cost if accident_detected else 0)`. Stage 1 and Stage 2 may use different models with different per-token rates.
-
----
-
-## Research Directions
-
-| # | Direction | Module | Status |
+| Group | Axis | Configs | Rationale |
 |---|---|---|---|
-| 1 | Prompt engineering (default / strict / high_recall) | `pipeline/detection.py`, `pipeline/classification.py` | ✅ impl |
-| 2 | Structured decomposed output | `pipeline/structured_output.py` | ✅ impl |
-| 3 | Voting ensemble (`n_votes` param) | `pipeline/detection.py` | ✅ impl |
-| 4 | Top-k/p sampling distribution | `experiments/sampling.py` | ✅ impl |
-| 5 | Multi-agent judge/jury | `experiments/multi_agent.py` | ✅ impl |
-| 6 | Near-miss detection | `pipeline/near_miss.py` | ✅ impl |
-| 7 | Failure mode diagnostics | `evaluation/confusion.py` | ✅ impl |
-| 8 | 6-group ablation framework | `experiments/ablation.py` | ✅ impl |
-| 9 | Augmentation robustness (originals + augmented) | `originals_only` / `augmented_only` config flags | ✅ impl |
-| 10 | EHS report auto-population | `evaluation/ehs_report.py` | ✅ impl |
-| 11 | High-recall cheap Stage 1 gate | `stage1_model` + `high_recall` prompt | ✅ impl |
-| 12 | Auto-increment attempt number | `runner.py --next` / `next_attempt_number()` | ✅ impl |
-| 13 | Phased sweep (originals → augmented) | `ablation.run_full_phased_sweep()` | ✅ impl |
-| 14 | Pareto-optimal config selection (F1 vs cost) | `ablation.get_pareto_front()`, `select_best_configs()` | ✅ impl |
+| **C** | binary_prompt × classification_prompt | 6 | Prompt quality is the highest-leverage lever and cheapest to sweep |
+| **D** | confidence_threshold × binary_prompt | 10 | Tests whether gating Stage 2 by confidence saves cost without hurting recall |
+| **F** | stage1_model × threshold × n_votes | 8 | Core cost-optimisation hypothesis: cheap gate + n_votes=1 |
+| **B** | n_votes × vote_policy | 9 | Ensemble quality; n_votes=5 costs 5× on non-accidents, needs justification |
+| **A** | temperature × top_p × top_k | 27 | Sampling space; most configs, run after cheaper groups confirm it matters |
+| **E** | stage1_model × model | 4 | Model tier; Pro is expensive, run last once other axes are settled |
+| **G** | binary_prompt × classification_prompt (Phase 3) | 6 | Re-evaluates prompts with best sampling locked in and working structured prompt |
+| **H** | stage1_model × stage2_model (Phase 3) | 4 | Confirms model tier under CoT prompting |
+
+### Why This Run Order
+
+Groups C and F are run first because they answer the most practically important questions — does the prompt wording matter, and can we make Stage 1 dramatically cheaper — at the lowest experimental cost (6 and 8 configs respectively). Group A (27 configs) is deferred until sampling variance is confirmed to be meaningful. Group E (Pro model) is run last because it is the most expensive and Phase 1 already suggested the answer.
+
+### Baseline Config Isolation
+
+Each group holds all other parameters at their baseline to avoid confounding:
+- **A**: n_votes=3, prompt=default, threshold=0.0 — sampling must be the only variable
+- **B**: temperature=0.3 fixed — at temp=0, all votes are identical (greedy decoding)
+- **C**: temperature=0.1, n_votes=3, threshold=0.0 — prompt is the only variable
+- **F**: binary_prompt fixed to `high_recall`, `use_frame_fallback` fixed to False — cost-optimised group must never re-check Stage 1 negatives
+- **G/H**: A_026 sampling locked in (temp=0.7, top_p=0.95, top_k=40) — Phase 3 varies only prompt and model
+
+### Phased Sweep Design
+
+**Phase 1** (Groups A–F) runs all 64 configs on the 73 original clips. After completion, `select_best_configs()` applies Pareto selection on binary_F1 vs cost, producing a shortlist of 3–5 configs on the efficient frontier.
+
+**Phase 2** re-evaluates that shortlist on the augmented video set (`type1/` and `type2/` variants) to measure robustness under video quality variation. Augmented video IDs embed the original VID key (e.g., `VID042_type1_aug_brightness`) so ground-truth matching works without a separate augmented GT file.
+
+**Phase 3** (Groups G–H) locks in the Phase 1 best sampling parameters and re-evaluates prompt variants with the working structured prompt, then re-confirms model tier under CoT prompting.
+
+---
+
+## Key Findings
+
+Full results in [FINDINGS.md](FINDINGS.md). Summary:
+
+| Finding | Result |
+|---|---|
+| Best binary detection | F1=0.941 (A_026: temp=0.7, top_p=0.95, top_k=40, n_votes=3, `any`) |
+| Most robust config | A_020 (Δ=−0.009 under augmentation) |
+| Best cost-optimised | F_006: F1=0.927, $0.011/73 clips (vs $0.021 for A_026) |
+| Best multiclass (Phase 3) | G_005: macro_F1=0.671, any_match_recall=0.698 |
+| Pro vs Flash | Pro: 4.5–7.4× cost, consistently lower F1 — not justified |
+| Flash-Lite gate | binary_F1 drops to 0.805–0.843 — not acceptable for safety |
+| CoT prompt improvement | macro_F1 +0.107 over default prompt (0.680 vs 0.573) |
+| Production cost | ~$0.30/camera/day at 1% accident rate |
+| Throughput (8 workers) | ~24 cameras supported in real time |
+| EHS report | Full structured report generated per detected accident |
 
 ---
 
 ## Dataset
 
-73 real YouTube workplace safety clips across 11 incident categories:
-Arc Flash, Caught In Machine, Electrocution, Fall, Fire, Gas Inhalation, Lifting, Slip, Struck by Object, Trip, Vehicle Incident.
+73 real workplace safety clips sourced from YouTube, spanning 11 incident categories: Arc Flash, Caught In Machine, Electrocution, Fall, Fire, Gas Inhalation, Lifting, Slip, Struck by Object, Trip, Vehicle Incident. The evaluation set is dominated by Trip, Struck by Object, and Vehicle Incident. Ground truth is stored in `data/dataset_mapping.xlsx` with one row per clip.
 
-Videos are identified by row order in `dataset_mapping.xlsx` → `VID000`–`VID072` (0-indexed, 3-digit zero-padded).
+Augmented variants (brightness, contrast, and noise transforms) in `type1/` and `type2/` subfolders are used for robustness evaluation in Phase 2 only.
+
+---
+
+## Output Format
+
+Each experiment run writes to `outputs/<timestamp>_<run_id>/`:
+
+| File | Contents |
+|---|---|
+| `predictions.jsonl` | One record per video: stage1/2 latency, cost estimate, votes, predicted category, `all_categories`, `ehs_report` |
+| `metrics.json` | binary_F1, macro_F1, per_class_F1, any_match_recall, binary_recall, binary_precision, total cost, mean latency |
+| `failed_videos.csv` | Videos that errored during inference |
+| `config_snapshot.yaml` | Full config used for this run |

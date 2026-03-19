@@ -112,6 +112,20 @@ def load_predictions_jsonl(jsonl_path: str) -> pd.DataFrame:
     df["pred_binary"] = df["predicted_category"].apply(
         lambda x: "Accident" if x != "No Accident" else "No Accident"
     )
+
+    # Parse all_categories from JSON string if needed (JSONL reload gives strings)
+    if "all_categories" in df.columns:
+        def _parse_cats(v):
+            if isinstance(v, list):
+                return v
+            if isinstance(v, str):
+                try:
+                    return json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return []
+        df["all_categories"] = df["all_categories"].apply(_parse_cats)
+
     return df
 
 
@@ -160,6 +174,39 @@ def multiclass_metrics(merged: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+# ── Multi-label any-match metric ──────────────────────────────────────────────
+
+def any_match_metrics(merged: pd.DataFrame) -> dict[str, float]:
+    """
+    Multi-label recall: for accident clips, was the GT category predicted anywhere?
+
+    The structured prompt returns a ranked `all_categories` list. The primary
+    prediction (highest confidence) is used for standard metrics. But the GT
+    category may appear as a secondary prediction — this metric captures that.
+
+    Only evaluated on clips where true_binary == "Accident".
+    Returns empty dict if all_categories column is absent.
+    """
+    if "all_categories" not in merged.columns:
+        return {}
+
+    accident_rows = merged[merged["true_binary"] == "Accident"].copy()
+    if len(accident_rows) == 0:
+        return {}
+
+    def _gt_in_any(row) -> bool:
+        cats = row.get("all_categories", [])
+        if not isinstance(cats, list):
+            return False
+        cat_names = [c.get("category", "") for c in cats if isinstance(c, dict)]
+        return row["true_category"] in cat_names
+
+    accident_rows["any_match"] = accident_rows.apply(_gt_in_any, axis=1)
+    return {
+        "any_match_recall": round(float(accident_rows["any_match"].mean()), 4),
+    }
+
+
 # ── All metrics ───────────────────────────────────────────────────────────────
 
 def evaluate(
@@ -184,6 +231,7 @@ def evaluate(
 
     bm = binary_metrics(merged)
     mm = multiclass_metrics(merged)
+    am = any_match_metrics(merged)
 
     return {
         "run_id": run_id,
@@ -195,4 +243,5 @@ def evaluate(
         "macro_f1": mm["macro_f1"],
         "weighted_f1": mm["weighted_f1"],
         "per_class_f1": mm["per_class_f1"],
+        **am,
     }

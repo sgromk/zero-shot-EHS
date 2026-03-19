@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from vertexai.generative_models import Part
 
 from config.categories import MERGED_CATEGORIES, DEFAULT_FALLBACK_CATEGORY
 
@@ -99,6 +98,8 @@ class ExperimentRunner:
         # thread-safe. Set to 8–16 when you have high API quota.
         # sleep_between_videos is ignored when max_workers > 1.
         self.max_workers: int = int(exp_config.get("max_workers", 1))
+        # max_videos > 0 truncates the video list — useful for smoke tests.
+        self.max_videos: int = int(exp_config.get("max_videos", 0))
 
         # ── Local mode (no GCS required) ──────────────────────────────────────
         # Set "local_videos_dir" in config to run against local .mp4 files.
@@ -123,6 +124,11 @@ class ExperimentRunner:
             run_id=f"{timestamp}_{self.run_name}",
             output_dir=self.output_dir,
         )
+
+        # Write config snapshot immediately so select_best_configs() can read it
+        snapshot_path = os.path.join(self.output_dir, "config_snapshot.yaml")
+        with open(snapshot_path, "w") as f:
+            yaml.dump(exp_config, f, default_flow_style=False, sort_keys=True)
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ExperimentRunner":
@@ -173,6 +179,8 @@ class ExperimentRunner:
             video_items = ingestion.list_video_blobs()
             mode = "GCS"
 
+        if self.max_videos > 0:
+            video_items = video_items[: self.max_videos]
         print(f"[{self.run_name}] {mode} mode — {len(video_items)} videos")
 
         tmp_frame_dir = os.path.join(self.output_dir, "_tmp_frames")
@@ -262,6 +270,7 @@ class ExperimentRunner:
         tmp_frame_dir: str,
     ) -> None:
         # ── Resolve video_id, uri, Part, and local path ───────────────────────
+        from vertexai.generative_models import Part
         if mode == "spreadsheet":
             clip = item
             video_id = clip["video_id"]
