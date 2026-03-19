@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,7 @@ class ExperimentRunner:
             exp_config.get("confidence_threshold", 0.6)
         )
         self.use_frame_fallback: bool = bool(
-            exp_config.get("use_frame_fallback", True)
+            exp_config.get("use_frame_fallback", False)
         )
         self.frame_fallback_fps: float = float(
             exp_config.get("frame_fallback_fps", 2.0)
@@ -93,12 +94,19 @@ class ExperimentRunner:
         self.sleep_between_videos: float = float(
             exp_config.get("sleep_between_videos", 1.0)
         )
+        # max_workers > 1 enables parallel video processing within a run.
+        # Each worker fires its own API calls concurrently. The Gemini SDK is
+        # thread-safe. Set to 8–16 when you have high API quota.
+        # sleep_between_videos is ignored when max_workers > 1.
+        self.max_workers: int = int(exp_config.get("max_workers", 1))
 
         # ── Local mode (no GCS required) ──────────────────────────────────────
         # Set "local_videos_dir" in config to run against local .mp4 files.
         # Set "originals_only: false" to include augmented versions too.
+        # Set "augmented_only: true" for Phase 2 sweep (skip originals).
         self.local_videos_dir: str | None = exp_config.get("local_videos_dir")
         self.originals_only: bool = bool(exp_config.get("originals_only", True))
+        self.augmented_only: bool = bool(exp_config.get("augmented_only", False))
 
         # ── Spreadsheet mode ──────────────────────────────────────────────────
         # Set "spreadsheet_source" to a path to dataset_mapping.xlsx.
@@ -156,7 +164,9 @@ class ExperimentRunner:
             mode = "spreadsheet"
         elif self.local_videos_dir:
             video_items = ingestion.find_local_videos(
-                self.local_videos_dir, originals_only=self.originals_only
+                self.local_videos_dir,
+                originals_only=self.originals_only,
+                augmented_only=self.augmented_only,
             )
             mode = "local"
         else:
@@ -167,28 +177,83 @@ class ExperimentRunner:
 
         tmp_frame_dir = os.path.join(self.output_dir, "_tmp_frames")
 
+        kwargs = dict(
+            mode=mode,
+            stage1_model=stage1_model,
+            stage2_model=stage2_model,
+            binary_prompt=binary_prompt,
+            class_prompt=class_prompt,
+            tmp_frame_dir=tmp_frame_dir,
+        )
+
         try:
-            for item in video_items:
-                self._process_video(
-                    item=item,
-                    mode=mode,
-                    stage1_model=stage1_model,
-                    stage2_model=stage2_model,
-                    binary_prompt=binary_prompt,
-                    class_prompt=class_prompt,
-                    tmp_frame_dir=tmp_frame_dir,
-                )
-                time.sleep(self.sleep_between_videos)
+            if self.max_workers > 1:
+                print(f"[{self.run_name}] Parallel mode — {self.max_workers} workers")
+                with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                    futures = {
+                        pool.submit(self._process_video, item, **kwargs): item
+                        for item in video_items
+                    }
+                    for future in as_completed(futures):
+                        exc = future.exception()
+                        if exc:
+                            # _process_video already catches and logs per-video errors;
+                            # this guards against unexpected escapes
+                            print(f"  [parallel] unhandled error: {exc}")
+            else:
+                for item in video_items:
+                    self._process_video(item, **kwargs)
+                    time.sleep(self.sleep_between_videos)
         finally:
-            self.logger.save_all()
+            agg = self.logger.save_all()
             shutil.rmtree(tmp_frame_dir, ignore_errors=True)
+            self._write_full_metrics(agg)
             print(f"[{self.run_name}] Done. Results in: {self.output_dir}")
+
+    # ── Post-run evaluation ───────────────────────────────────────────────────
+
+    def _write_full_metrics(self, agg: dict) -> None:
+        """
+        Merge evaluation metrics into metrics.json after the run completes.
+
+        Calls evaluation.metrics.evaluate() against the ground-truth spreadsheet
+        so that compare_results() in ablation.py sees binary_f1, macro_f1, etc.
+        Does nothing if no spreadsheet_source is configured.
+        """
+        if not self.spreadsheet_source:
+            return
+        if not os.path.exists(self.logger.predictions_path):
+            return
+
+        import json as _json
+        from evaluation.metrics import evaluate
+
+        try:
+            eval_results = evaluate(
+                predictions_jsonl=self.logger.predictions_path,
+                ground_truth_excel=self.spreadsheet_source,
+                run_id=self.run_name,
+                total_cost_usd=agg.get("total_cost_usd", 0.0),
+                mean_latency_s=agg.get("mean_latency_s", 0.0),
+            )
+            # Merge aggregate counts back in (n_videos, n_failed)
+            eval_results["n_videos"] = agg.get("n_videos", 0)
+            eval_results["n_failed"] = agg.get("n_failed", 0)
+            with open(self.logger.metrics_path, "w") as f:
+                _json.dump(eval_results, f, indent=2)
+            print(
+                f"  binary_f1={eval_results.get('binary_f1', float('nan')):.3f}  "
+                f"macro_f1={eval_results.get('macro_f1', float('nan')):.3f}"
+            )
+        except Exception as exc:
+            print(f"  [warn] Could not compute evaluation metrics: {exc}")
 
     # ── Per-video logic ───────────────────────────────────────────────────────
 
     def _process_video(
         self,
         item: Any,              # str (local path), Blob (GCS), or dict (spreadsheet)
+        *,
         mode: str,              # "local" | "GCS" | "spreadsheet"
         stage1_model: Any,      # binary detection model (cheap, high recall)
         stage2_model: Any,      # classification model
@@ -278,6 +343,8 @@ class ExperimentRunner:
                     frame_fallback_used=frame_fallback_used,
                     frame_fallback_latency=frame_fallback_latency,
                     model_name=self.model_name,
+                    stage1_model_name=self.stage1_model_name,
+                    n_votes=self.n_votes,
                     temperature=self.temperature,
                     top_k=self.top_k,
                     top_p=self.top_p,
@@ -301,6 +368,8 @@ class ExperimentRunner:
                 frame_fallback_used=frame_fallback_used,
                 frame_fallback_latency=frame_fallback_latency,
                 model_name=self.model_name,
+                stage1_model_name=self.stage1_model_name,
+                n_votes=self.n_votes,
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,

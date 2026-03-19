@@ -22,11 +22,13 @@ Capstone/
 │   ├── runner.py         # Main batch runner (reads YAML config)
 │   ├── sampling.py       # Top-k/p probabilistic sweeps
 │   ├── multi_agent.py    # Three-agent judge/jury pipeline
-│   ├── ablation.py       # 6-group ablation framework
+│   ├── ablation.py       # 6-group ablation + phased sweep orchestration
 │   └── configs/          # YAML configs: attempt1–4 + ablation_grid
 ├── evaluation/           # Metrics, confusion analysis, plots
 │   ├── metrics.py        # Binary + multiclass metrics, GT loader
-│   └── visualize.py      # generate_report() → single PDF output
+│   ├── visualize.py      # generate_report() → single PDF output
+│   ├── confusion.py      # Failure diagnostics (FP/FN analysis)
+│   └── ehs_report.py     # OSHA category mapping, EHS report builder
 ├── run_logging/          # Per-video JSONL logger + cost estimator
 ├── notebooks/            # Reference + analysis notebooks
 ├── data/
@@ -40,7 +42,8 @@ Capstone/
 └── outputs/              # Experiment results (gitignored)
     └── <timestamp>_<run_id>/
         ├── predictions.jsonl
-        ├── metrics.json
+        ├── metrics.json      # binary_f1, macro_f1, per_class_f1, cost, latency
+        ├── failed_videos.csv
         └── report.pdf
 ```
 
@@ -93,31 +96,63 @@ Ground truth: `data/dataset_mapping.xlsx` — 73 rows, columns:
 
 ## Running Experiments
 
+### Single experiment
 ```bash
 # Run a specific experiment config
 python -m experiments.runner experiments/configs/attempt2.yaml
 
 # Auto-detect the next attempt (scans outputs/ for highest attempt{n})
 python -m experiments.runner --next
+```
 
-# Evaluate results against ground truth
-python -m evaluation.metrics outputs/<timestamp>_attempt2/predictions.jsonl
+After each run, `metrics.json` is automatically populated with binary_f1, macro_f1, per_class_f1, cost, and latency (requires `spreadsheet_source` to be set in the config).
 
-# Generate PDF report (metrics table + confusion matrices)
-python -c "
+### Ablation sweep — phased approach
+
+Phase 1 sweeps all 64 configs over the 73 originals. Phase 2 runs the best-performing configs on augmented videos.
+
+```python
+# Full two-phase sweep (recommended)
+from experiments.ablation import run_full_phased_sweep
+run_full_phased_sweep(n_top=5)
+
+# Smoke test — 1 config per group, skips nothing
+run_full_phased_sweep(n_top=3, max_configs_per_group=1)
+
+# Run phases independently
+from experiments.ablation import run_phase1_sweep, select_best_configs, run_phase2_augmented
+
+phase1 = run_phase1_sweep()                            # C → D → F → B → A → E
+all_dirs = [d for dirs in phase1.values() for d in dirs]
+best = select_best_configs(all_dirs, n=5)              # top-N + Pareto front
+run_phase2_augmented(best)                             # type1/ + type2/ videos
+
+# Run a single group
+from experiments.ablation import run_study_group
+run_study_group('C')
+```
+
+### Compare results across runs
+```python
+from experiments.ablation import compare_results
+compare_results(["outputs/phase1_C_000", "outputs/phase1_C_001", ...])
+# Prints: BinF1 | MacF1 | BinRec | BinPre | Lat(s) | Cost($) | weak-category F1s
+```
+
+### Generate a PDF report
+```python
 from evaluation.visualize import generate_report
 generate_report(
     'outputs/<timestamp>_attempt2/predictions.jsonl',
     'data/dataset_mapping.xlsx',
     'outputs/<timestamp>_attempt2/report.pdf',
     run_id='attempt2',
-)"
-
-# Run an ablation study group
-python -c "from experiments.ablation import run_study_group; run_study_group('F')"
+)
 ```
 
-Experiment configs in `experiments/configs/`:
+---
+
+## Experiment Configs
 
 | Config | Description | Status |
 |---|---|---|
@@ -130,38 +165,86 @@ Experiment configs in `experiments/configs/`:
 
 ---
 
-## Optimization Goals
+## Pipeline Design
 
-The pipeline targets three dimensions for improvement:
+### Two-stage inference
 
-### Latency
-- Reduce prompt length (concise prompts → fewer input tokens → faster TTFT)
-- Tune `temperature` and `top_p` to avoid long sampling tails
-- Skip Stage 2 (classification) when Stage 1 confidence is below threshold
-- Evaluate frame-fallback cost vs. latency tradeoff: full video vs. N sampled frames
+```
+Every video
+    │
+    ▼
+Stage 1 (binary gate)
+    model:  stage1_model   (default: gemini-2.5-flash, or gemini-2.0-flash-lite for cost opt.)
+    prompt: binary_prompt_variant  (default | strict | high_recall)
+    calls:  n_votes  (1–5 independent calls, combined by vote_policy)
+    │
+    ├─ "No Accident" ──→ STOP. Log prediction. No Stage 2 call.
+    │                    (single-pass: critical for 99%-negative real-world footage)
+    │
+    └─ "Accident" ─────→ Stage 2 (classifier)
+                            model:  model  (gemini-2.5-flash)
+                            prompt: classification_prompt_variant
+                            output: incident category + timing + RCA
+```
 
-### Cost
-- **High-recall cheap gate (key strategy)**: Surveillance footage is highly imbalanced — in real deployment, ~99% of clips contain no accident. The pipeline exploits this with a two-model approach:  
-  - `stage1_model` (`gemini-2.0-flash-lite` + `high_recall` prompt): runs on every video. Must have near-perfect recall. Missing an accident here is a critical failure. Tolerates false positives since Stage 2 corrects them.
-  - `model` (`gemini-2.5-flash`): only runs on videos Stage 1 flags as accidents (~1% in real deployment). This is where accuracy matters.
-  - Net effect: Stage 2 cost scales with incident rate, not video volume.
-- The `confidence_threshold` parameter gates Stage 2 — only classify videos the model is confident are positive
-- Compare per-video cost at `originals_only: true` vs. `false` (originals + augmented is ~11× more expensive)
-- `stage1_model: gemini-2.0-flash-lite` is the primary cost lever for the gate
+### Cost optimization (single-pass for non-accidents)
 
-### Ablation Studies
-See `experiments/configs/ablation_grid.yaml` for the full parameter space. Six study groups:
+In real surveillance deployment, ~99% of footage has no accident. The pipeline is designed so non-accident clips receive exactly **one cheap Stage 1 call** and stop. Accident clips receive Stage 1 + Stage 2.
 
-| Group | Axes | Combinations | Goal |
-|---|---|---|---|
-| **A** | temperature × top_p × top_k | 27 | Understand sampling stochasticity |
-| **B** | n_votes × vote_policy (temp=0.3 fixed) | 9 | Optimal ensemble strategy |
-| **C** | binary_prompt × classification_prompt | 6 | Prompt framing effect |
-| **D** | confidence_threshold × binary_prompt | 10 | Stage 2 gating vs. recall tradeoff |
-| **E** | stage1_model × model | 4 | Model tier selection |
-| **F** | stage1_model × threshold × n_votes (high_recall fixed) | 8 | Cost optimization |
+Key config for cost optimization:
+- `stage1_model: gemini-2.0-flash-lite` — cheapest model for gating
+- `binary_prompt_variant: high_recall` — aggressive: flags any ambiguity, never misses a real accident
+- `n_votes: 1` — single Stage 1 call per video (eliminates ensemble overhead on non-accidents)
+- `use_frame_fallback: false` — frame fallback re-checks Stage 1 negatives; disable for cost opt.
+- `confidence_threshold: 0.0` — pass all Stage 1 positives to Stage 2 (no additional gating)
 
-Run a group: `python -c "from experiments.ablation import run_study_group; run_study_group('A')"`
+Stage 1 recall must stay ≥ 0.97. Stage 1 precision is irrelevant — Stage 2 corrects false positives.
+
+---
+
+## Ablation Studies
+
+Six study groups, 64 total configurations. Run in the order below (cheapest/most-impactful first):
+
+| Order | Group | Axes | Configs | Key metric |
+|---|---|---|---|---|
+| 1 | **C** | binary_prompt × classification_prompt | 6 | binary_f1, macro_f1 |
+| 2 | **D** | confidence_threshold × binary_prompt | 10 | binary_recall, cost |
+| 3 | **F** | stage1_model × threshold × n_votes (high_recall, no fallback) | 8 | Stage 1 recall, cost |
+| 4 | **B** | n_votes × vote_policy (temp=0.3 fixed) | 9 | binary_recall, cost |
+| 5 | **A** | temperature × top_p × top_k | 27 | binary_f1, latency |
+| 6 | **E** | stage1_model × model | 4 | recall (Stage 1), macro_f1 (Stage 2) |
+
+`SWEEP_ORDER = ["C", "D", "F", "B", "A", "E"]` is enforced by `run_phase1_sweep()`.
+
+### Config isolation rules
+- **A**: keep n_votes=3, prompt=default, threshold=0.0
+- **B**: keep temperature=0.3 (temp=0 makes all votes identical)
+- **C**: keep temperature=0.1, n_votes=3, threshold=0.0
+- **D**: use best binary_prompt from Group C
+- **E**: fix everything else, vary only model tiers
+- **F**: binary_prompt fixed to `high_recall`; `use_frame_fallback` fixed to `False`
+
+### Phase 2 — Augmented videos
+
+After Phase 1 identifies the top configs, `run_phase2_augmented()` reruns them on `type1/` and `type2/` augmented variants. Ground truth is matched by stripping the augmented suffix from the video ID (e.g., `VID042_type1_aug_bright` → `VID042`).
+
+Use `augmented_only: true` in a YAML config to run augmented videos only without re-running originals.
+
+---
+
+## Output Format
+
+Each run writes to `outputs/<timestamp>_<run_id>/`:
+
+| File | Description |
+|---|---|
+| `predictions.jsonl` | Per-video predictions: stage1/stage2 latency, estimated cost, votes, category |
+| `failed_videos.csv` | Videos that errored out |
+| `metrics.json` | Full metrics: binary_f1, macro_f1, per_class_f1, binary_recall, binary_precision, cost, latency |
+| `report.pdf` | Metrics table + binary CM + multiclass CM |
+
+Cost is estimated per-video as: `n_votes × stage1_cost + (stage2_cost if accident_detected else 0)`. Stage 1 and Stage 2 may use different models with different per-token rates.
 
 ---
 
@@ -177,23 +260,12 @@ Run a group: `python -c "from experiments.ablation import run_study_group; run_s
 | 6 | Near-miss detection | `pipeline/near_miss.py` | ✅ impl |
 | 7 | Failure mode diagnostics | `evaluation/confusion.py` | ✅ impl |
 | 8 | 6-group ablation framework | `experiments/ablation.py` | ✅ impl |
-| 9 | Augmentation robustness | `originals_only: false` in config | ✅ impl |
+| 9 | Augmentation robustness (originals + augmented) | `originals_only` / `augmented_only` config flags | ✅ impl |
 | 10 | EHS report auto-population | `evaluation/ehs_report.py` | ✅ impl |
 | 11 | High-recall cheap Stage 1 gate | `stage1_model` + `high_recall` prompt | ✅ impl |
 | 12 | Auto-increment attempt number | `runner.py --next` / `next_attempt_number()` | ✅ impl |
-
----
-
-## Output Format
-
-Each run writes to `outputs/<timestamp>_<run_id>/`:
-
-| File | Description |
-|---|---|
-| `predictions.jsonl` | Per-video predictions with confidence, latency, cost |
-| `failed_videos.csv` | Videos that errored out |
-| `metrics.json` | Aggregate binary + multiclass metrics |
-| `report.pdf` | Metrics table + binary CM + multiclass CM |
+| 13 | Phased sweep (originals → augmented) | `ablation.run_full_phased_sweep()` | ✅ impl |
+| 14 | Pareto-optimal config selection (F1 vs cost) | `ablation.get_pareto_front()`, `select_best_configs()` | ✅ impl |
 
 ---
 

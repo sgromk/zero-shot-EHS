@@ -10,6 +10,7 @@ Supports:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from vertexai.generative_models import GenerativeModel, Part
@@ -215,21 +216,37 @@ def detect(
         else config.confidence_threshold
     )
 
-    votes: list[bool] = []
-    confidences: list[float] = []
-    raws: list[str] = []
-
     t0 = time.perf_counter()
-    for _ in range(n):
+
+    if n == 1:
+        # Fast path — no threading overhead
         detected, conf, raw = detect_single(
             video_part, model=model, prompt=prompt,
             temperature=temperature, top_k=top_k, top_p=top_p,
         )
-        # Apply confidence threshold per vote
+        raw_results = [(detected, conf, raw)]
+    else:
+        # All votes are independent — fire them in parallel.
+        # GenerativeModel.generate_content() is thread-safe (stateless HTTP).
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futures = [
+                pool.submit(
+                    detect_single, video_part,
+                    model, prompt, temperature, top_k, top_p,
+                )
+                for _ in range(n)
+            ]
+            raw_results = [f.result() for f in futures]
+
+    elapsed = time.perf_counter() - t0
+
+    votes: list[bool] = []
+    confidences: list[float] = []
+    raws: list[str] = []
+    for detected, conf, raw in raw_results:
         votes.append(detected and conf >= threshold)
         confidences.append(conf)
         raws.append(raw)
-    elapsed = time.perf_counter() - t0
 
     if vote_policy == "any":
         incident = any(votes)

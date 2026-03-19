@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -23,18 +24,20 @@ from pipeline.classification import ClassificationResult
 # ── Token cost estimates (USD per 1K tokens) ─────────────────────────────────
 # Approximate Vertex AI / Google AI pricing — update as pricing changes.
 COST_PER_1K_INPUT_TOKENS: dict[str, float] = {
-    "gemini-2.5-flash":   0.000075,
-    "gemini-2.5-pro":     0.00125,
-    "gemini-2.0-flash":   0.000075,
-    "gemini-1.5-flash":   0.000075,
-    "gemini-1.5-pro":     0.00125,
+    "gemini-2.5-flash":      0.000075,
+    "gemini-2.5-pro":        0.00125,
+    "gemini-2.0-flash":      0.000075,
+    "gemini-2.0-flash-lite": 0.0000375,   # ~half of Flash; used for cheap Stage 1 gate
+    "gemini-1.5-flash":      0.000075,
+    "gemini-1.5-pro":        0.00125,
 }
 COST_PER_1K_OUTPUT_TOKENS: dict[str, float] = {
-    "gemini-2.5-flash":   0.0003,
-    "gemini-2.5-pro":     0.005,
-    "gemini-2.0-flash":   0.0003,
-    "gemini-1.5-flash":   0.0003,
-    "gemini-1.5-pro":     0.005,
+    "gemini-2.5-flash":      0.0003,
+    "gemini-2.5-pro":        0.005,
+    "gemini-2.0-flash":      0.0003,
+    "gemini-2.0-flash-lite": 0.00015,     # ~half of Flash
+    "gemini-1.5-flash":      0.0003,
+    "gemini-1.5-pro":        0.005,
 }
 
 
@@ -54,6 +57,7 @@ class ExperimentLogger:
 
         self._records: list[dict[str, Any]] = []
         self._failures: list[dict[str, str]] = []
+        self._lock = threading.Lock()  # protects all writes (for parallel video processing)
 
         # Open CSV for failures
         self._failures_file = open(self.failures_path, "w", newline="")
@@ -73,9 +77,11 @@ class ExperimentLogger:
         frame_fallback_used: bool,
         frame_fallback_latency: float,
         model_name: str,
-        temperature: float,
-        top_k: int | None,
-        top_p: float | None,
+        stage1_model_name: str | None = None,
+        n_votes: int = 1,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
     ) -> None:
         """Append one prediction record."""
         # Resolve classification fields
@@ -101,8 +107,13 @@ class ExperimentLogger:
             detection.latency_s + stage2_latency + frame_fallback_latency
         )
 
-        # Token cost estimation (rough — vertex response doesn't always expose tokens)
-        estimated_cost = _estimate_cost(model_name, total_latency)
+        # Accurate cost: n_votes Stage-1 calls + 1 Stage-2 call only if accident detected
+        estimated_cost = _estimate_cost(
+            stage2_model=model_name,
+            stage1_model=stage1_model_name or model_name,
+            n_votes=n_votes,
+            stage1_detected=detection.incident_detected,
+        )
 
         record: dict[str, Any] = {
             "run_id": self.run_id,
@@ -137,11 +148,11 @@ class ExperimentLogger:
             "top_p": top_p,
         }
 
-        self._records.append(record)
-
-        # Write immediately so partial runs are recoverable
-        with open(self.predictions_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        with self._lock:
+            self._records.append(record)
+            # Write immediately so partial runs are recoverable
+            with open(self.predictions_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
 
     # ── Log a failure ─────────────────────────────────────────────────────────
 
@@ -152,19 +163,25 @@ class ExperimentLogger:
             "error": error,
             "timestamp": datetime.now().isoformat(),
         }
-        self._failures.append(row)
-        self._failures_writer.writerow(row)
-        self._failures_file.flush()
+        with self._lock:
+            self._failures.append(row)
+            self._failures_writer.writerow(row)
+            self._failures_file.flush()
 
     # ── Finalize ──────────────────────────────────────────────────────────────
 
-    def save_all(self) -> None:
-        """Write aggregate stats. Call once after all videos are processed."""
+    def save_all(self) -> dict:
+        """
+        Write aggregate stats and return them.
+
+        Returns the summary dict so the caller can pass cost/latency into
+        evaluation.metrics.evaluate() without re-reading the file.
+        """
         self._failures_file.close()
 
         n = len(self._records)
         if n == 0:
-            return
+            return {}
 
         total_cost = sum(r["estimated_cost_usd"] for r in self._records)
         mean_latency = sum(r["total_latency_s"] for r in self._records) / n
@@ -173,7 +190,7 @@ class ExperimentLogger:
             "run_id": self.run_id,
             "n_videos": n,
             "n_failed": len(self._failures),
-            "total_cost_usd": round(total_cost, 4),
+            "total_cost_usd": round(total_cost, 6),
             "mean_latency_s": round(mean_latency, 3),
             "generated_at": datetime.now().isoformat(),
         }
@@ -181,7 +198,8 @@ class ExperimentLogger:
             json.dump(summary, f, indent=2)
 
         print(f"  Logged {n} predictions, {len(self._failures)} failures")
-        print(f"  Estimated cost: ${total_cost:.4f} | Mean latency: {mean_latency:.1f}s")
+        print(f"  Estimated cost: ${total_cost:.6f} | Mean latency: {mean_latency:.1f}s")
+        return summary
 
     # ── Export helpers ────────────────────────────────────────────────────────
 
@@ -193,23 +211,49 @@ class ExperimentLogger:
 
 # ── Cost estimation ───────────────────────────────────────────────────────────
 
-def _estimate_cost(model_name: str, total_latency_s: float) -> float:
-    """
-    Rough cost estimate based on token throughput approximation.
+# Approximate token counts per API call (video context is large but billed per token).
+# These are rough but consistent across runs — relative comparisons are reliable.
+_STAGE1_INPUT_TOKENS = 800    # video + short binary prompt
+_STAGE1_OUTPUT_TOKENS = 30    # {"incident_detected": true, "confidence": 0.9}
+_STAGE2_INPUT_TOKENS = 1200   # video + longer classification prompt
+_STAGE2_OUTPUT_TOKENS = 200   # full JSON classification response
 
-    ~500 tokens/s for Flash models is a conservative estimate for
-    combined input+output tokens in a video analysis context.
-    """
-    # Approximate token counts based on latency (very rough heuristic)
-    approx_input_tokens = 1000   # video context + prompt
-    approx_output_tokens = 150   # JSON response
 
-    input_cost = (
-        approx_input_tokens / 1000
-        * COST_PER_1K_INPUT_TOKENS.get(model_name, 0.0001)
+def _estimate_cost(
+    stage2_model: str,
+    stage1_model: str,
+    n_votes: int,
+    stage1_detected: bool,
+) -> float:
+    """
+    Estimate API cost for one video.
+
+    Stage 1 runs n_votes times on every video (cheap model, short prompt).
+    Stage 2 runs once only when Stage 1 detected an accident (skip for non-accidents).
+
+    Parameters
+    ----------
+    stage2_model : str
+        Model name used for Stage 2 classification.
+    stage1_model : str
+        Model name used for Stage 1 binary gate (may differ from stage2_model).
+    n_votes : int
+        Number of Stage 1 calls made (ensemble size).
+    stage1_detected : bool
+        Whether Stage 1 flagged an accident (determines if Stage 2 ran).
+    """
+    s1_in  = COST_PER_1K_INPUT_TOKENS.get(stage1_model,  0.000075)
+    s1_out = COST_PER_1K_OUTPUT_TOKENS.get(stage1_model, 0.0003)
+    s2_in  = COST_PER_1K_INPUT_TOKENS.get(stage2_model,  0.000075)
+    s2_out = COST_PER_1K_OUTPUT_TOKENS.get(stage2_model, 0.0003)
+
+    stage1_cost = n_votes * (
+        _STAGE1_INPUT_TOKENS / 1000 * s1_in
+        + _STAGE1_OUTPUT_TOKENS / 1000 * s1_out
     )
-    output_cost = (
-        approx_output_tokens / 1000
-        * COST_PER_1K_OUTPUT_TOKENS.get(model_name, 0.0003)
-    )
-    return input_cost + output_cost
+    stage2_cost = (
+        _STAGE2_INPUT_TOKENS / 1000 * s2_in
+        + _STAGE2_OUTPUT_TOKENS / 1000 * s2_out
+    ) if stage1_detected else 0.0
+
+    return stage1_cost + stage2_cost

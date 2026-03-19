@@ -62,6 +62,7 @@ def upload_video(local_path: str, blob_name: str) -> str:
 def find_local_videos(
     root_dir: str,
     originals_only: bool = True,
+    augmented_only: bool = False,
 ) -> list[str]:
     """
     Walk the local dataset directory and return video paths.
@@ -80,7 +81,11 @@ def find_local_videos(
         Path to the videos root (e.g. "data/videos").
     originals_only : bool
         If True  → return only original.mp4 files (73 videos).
-        If False → return original + all augmented files (73 × 11).
+        If False → return original + all augmented files.
+    augmented_only : bool
+        If True → return only augmented files (type1/ and type2/ subdirs),
+        skipping original.mp4. Overrides originals_only.
+        Used for Phase 2 of the ablation sweep.
 
     Returns
     -------
@@ -91,7 +96,19 @@ def find_local_videos(
     root = os.path.abspath(root_dir)
     paths: list[str] = []
 
-    if originals_only:
+    if augmented_only:
+        # Only files inside type1/ and type2/ subdirectories
+        for vid_folder in sorted(os.listdir(root)):
+            vid_path = os.path.join(root, vid_folder)
+            if not os.path.isdir(vid_path):
+                continue
+            for sub in ("type1", "type2"):
+                sub_path = os.path.join(vid_path, sub)
+                if os.path.isdir(sub_path):
+                    for f in sorted(os.listdir(sub_path)):
+                        if f.lower().endswith(".mp4"):
+                            paths.append(os.path.join(sub_path, f))
+    elif originals_only:
         # Only files literally named "original.mp4" at depth 1
         pattern = os.path.join(root, "*", "original.mp4")
         paths = glob.glob(pattern)
@@ -120,12 +137,37 @@ def video_id_from_path(path: str) -> str:
     """
     Extract the VID{n} identifier from a local video path.
 
-    e.g. /data/videos/VID042_slip_on_floor/original.mp4 → "VID042"
+    Works for both original and augmented video paths:
+        .../VID042_slip_on_floor/original.mp4  → "VID042"
+        .../VID042_slip_on_floor/type1/aug.mp4 → "VID042_type1_aug"
+
+    The composite augmented ID still contains VID042, so
+    load_predictions_jsonl() can strip it back to "VID042" for GT matching
+    via its existing re.search(r"(VID\\d+)", ...) logic.
     """
     import re
-    folder = os.path.basename(os.path.dirname(path))
-    match = re.search(r"(VID\d+)", folder)
-    return match.group(1) if match else os.path.splitext(os.path.basename(path))[0]
+    from pathlib import Path as _Path
+
+    parts = _Path(path).parts
+    vid_part: str | None = None
+    aug_type: str | None = None
+
+    for part in parts:
+        m = re.search(r"(VID\d{3})", part)
+        if m:
+            vid_part = m.group(1)
+        if part in ("type1", "type2"):
+            aug_type = part
+
+    if vid_part is None:
+        # No VID folder found — fall back to filename stem
+        return _Path(path).stem
+
+    if aug_type is not None:
+        stem = _Path(path).stem
+        return f"{vid_part}_{aug_type}_{stem}"
+
+    return vid_part
 
 
 def find_local_video_by_vid(root_dir: str, vid_id: str) -> str | None:
