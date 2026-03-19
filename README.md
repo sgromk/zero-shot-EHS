@@ -127,7 +127,7 @@ Full results in [FINDINGS.md](FINDINGS.md). Summary:
 
 ## Dataset
 
-73 real workplace safety clips sourced from YouTube, spanning 11 incident categories: Arc Flash, Caught In Machine, Electrocution, Fall, Fire, Gas Inhalation, Lifting, Slip, Struck by Object, Trip, Vehicle Incident. The evaluation set is dominated by Trip, Struck by Object, and Vehicle Incident. Ground truth is stored in `data/dataset_mapping.xlsx` with one row per clip.
+73 animated workplace safety videos sourced from YouTube, spanning 11 incident categories: Arc Flash, Caught In Machine, Electrocution, Fall, Fire, Gas Inhalation, Lifting, Slip, Struck by Object, Trip, Vehicle Incident. The evaluation set is dominated by Trip, Struck by Object, and Vehicle Incident. Ground truth is stored in `data/dataset_mapping.xlsx` with one row per clip.
 
 Augmented variants (brightness, contrast, and noise transforms) in `type1/` and `type2/` subfolders are used for robustness evaluation in Phase 2 only.
 
