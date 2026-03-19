@@ -111,8 +111,9 @@ Valid category names (copy exactly):
 Arc Flash | Caught In Machine | Electrocution | Fall | Fire | Gas Inhalation | \
 Lifting | Slip | Struck by Object | Trip | Vehicle Incident
 
-── STEP 3: EHS REPORT ────────────────────────────────────────────────────────
-Generate a brief professional EHS report suitable for incident documentation.
+── STEP 3: EHS / OSHA REPORT ─────────────────────────────────────────────────
+Generate a professional EHS report that maps directly onto OSHA 300-series incident
+documentation fields.
 
 Return ONLY valid JSON in this exact format:
 {
@@ -126,10 +127,14 @@ Return ONLY valid JSON in this exact format:
   "description": "clear factual description of what happened",
   "ehs_report": {
     "severity": "low | medium | high | critical",
+    "pre_incident_activity": "what the employee was doing just before the incident — include tools, equipment, or materials being used (e.g., 'climbing a ladder while carrying roofing materials')",
+    "what_happened": "how the injury occurred — describe the mechanism of injury (e.g., 'ladder slipped on wet floor, worker fell 10 feet onto concrete')",
+    "injury_description": "part of body affected and how it was affected (e.g., 'fractured left wrist', 'chemical burn to both hands', 'laceration to forehead')",
+    "direct_agent": "the specific object or substance that directly caused the harm (e.g., 'concrete floor', 'rotating saw blade', 'chlorine gas'). Leave blank if not identifiable.",
     "immediate_actions": "actions taken or required immediately after the incident",
-    "root_cause": "underlying cause of the incident",
-    "contributing_factors": "additional factors that contributed",
-    "corrective_measures": "preventive actions to avoid recurrence"
+    "root_cause": "underlying systemic cause of the incident",
+    "contributing_factors": "additional environmental or behavioural factors that contributed",
+    "corrective_measures": "specific preventive actions to avoid recurrence"
   }
 }
 
@@ -157,6 +162,7 @@ class ClassificationResult:
     incident_end_time: str | None
     confidence: float              # primary category confidence
     description: str
+    reasoning: str                 # CoT scene observation (structured prompt only)
     root_cause_analysis: str
     ehs_report: dict               # full EHS report (empty dict for legacy prompts)
     raw_response: str
@@ -245,6 +251,7 @@ def classify(
         incident_end_time=parsed.get("incident_end_time"),
         confidence=primary_confidence,
         description=parsed.get("description", ""),
+        reasoning=parsed.get("reasoning", ""),
         root_cause_analysis=root_cause,
         ehs_report=ehs_report,
         raw_response=raw,
