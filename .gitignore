@@ -1,5 +1,6 @@
-# ── Personal notes (local only) ──────────────────────────────────────────
+# ── Personal notes and plans (local only) ────────────────────────────────
 NOTES.md
+plans/
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 .env
@@ -19,6 +20,7 @@ env/
 # ── Outputs (results land here but are not committed) ─────────────────────────
 outputs/*/
 !outputs/.gitkeep
+outputs/vehicle_incident_investigation.txt
 
 # ── Temp video files ──────────────────────────────────────────────────────────
 ytvideos/
