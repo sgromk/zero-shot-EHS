@@ -153,29 +153,23 @@ This output maps directly onto standard incident reporting templates, requiring 
 
 ### Vehicle Incident — Root Cause Investigation
 
-Vehicle Incident F1 remained 0.000 across all 81 experimental runs. A dedicated diagnostic (`scripts/investigate_vehicle_incident.py`) was run to understand the failure mode at the model output level. The script runs VID002 — the only Vehicle Incident clip in the dataset — through Stage 1 with every binary prompt variant (5 votes each, full raw JSON captured) and through Stage 2 directly, bypassing Stage 1 entirely.
+Vehicle Incident F1 remained 0.000 across all 81 experimental runs. A dedicated investigation was conducted by running the single Vehicle Incident clip through Stage 1 with every binary prompt variant (5 votes each) and through Stage 2 directly, bypassing Stage 1 entirely.
 
-**What the diagnostic reveals:**
+**What the investigation reveals:**
 
-*Stage 1 failure.* The binary gate classifies VID002 as "no accident" on 100% of votes across all three prompt variants (`default`, `strict`, `high_recall`). The model never passes the clip to Stage 2. This means the F1=0.000 result is entirely a Stage 1 phenomenon — the Stage 2 prompt was never evaluated on this clip in any of the 81 runs.
+*Stage 1 failure.* The binary gate classifies the clip as "no accident" on 100% of votes across all three prompt variants (`default`, `strict`, `high_recall`). The model never passes the clip to Stage 2. The F1=0.000 result is entirely a Stage 1 phenomenon — the Stage 2 prompt was never evaluated on this clip in any of the 81 runs.
 
-*Stage 2 bypass.* When Stage 2 is run directly on VID002 (bypassing Stage 1), the structured CoT prompt may assign a primary label other than "Vehicle Incident" — reflecting that the model's scene-observation step does not confidently establish vehicle-to-person contact from the footage. The raw reasoning field in the bypass output reveals exactly what the model observed and where the category gap lies.
+*Stage 2 bypass.* When Stage 2 is run directly on the clip (bypassing Stage 1), the structured CoT prompt assigns a primary label other than "Vehicle Incident" — reflecting that the model's scene-observation step does not confidently establish vehicle-to-person contact from the footage.
 
-**Root causes (from diagnostic output):**
+**Root causes:**
 
-1. **Data sparsity.** VID002 is 1 of 73 clips (1.4% of the dataset). With a single sample the F1 metric is binary: any one missed detection equals F1=0.000. There is no statistical basis for assessing this category's performance.
+1. **Data sparsity.** This is 1 of 73 clips (1.4% of the dataset). With a single sample the F1 metric is binary: any one missed detection equals F1=0.000. There is no statistical basis for assessing this category's performance.
 
-2. **Stage 1 domain gap.** "Fork lift tips over" lacks clear visual person-injury signals — the model's binary prior requires a falling body, visible impact, or distress. An industrial forklift tip-over where person contact is ambiguous or off-camera does not reliably trigger a positive detection in zero-shot evaluation.
+2. **Stage 1 domain gap.** A forklift tip-over lacks clear visual person-injury signals — the model's binary prior requires a falling body, visible impact, or distress. A tip-over where person contact is ambiguous or off-camera does not reliably trigger a positive detection in zero-shot evaluation.
 
-3. **Labelling ambiguity.** The ground-truth description does not explicitly establish that a person was struck or harmed. The structured Stage 2 prompt requires the vehicle to "strike, run over, pin, or knock a person down" — a tip-over event is genuinely ambiguous against this rule.
+3. **Labelling ambiguity.** The ground-truth description does not explicitly establish that a person was struck or harmed. The structured Stage 2 prompt requires the vehicle to strike, run over, pin, or knock a person down — a tip-over event is genuinely ambiguous against this rule.
 
 4. **Deployment irrelevance.** The target environment is data centres. Data centres contain no forklifts or industrial vehicles by design. This category is out-of-scope for the primary use case and should not be treated as a system weakness in the sponsor context.
-
-To inspect the full raw model responses and reasoning for VID002, run:
-```bash
-python scripts/investigate_vehicle_incident.py
-# Output also saved to outputs/vehicle_incident_investigation.txt
-```
 
 ---
 
@@ -221,7 +215,7 @@ Stage 1 latency is high relative to the short output because n_votes=3 fires thr
 
 ### Batch Throughput and Concurrency
 
-In batch processing mode (`experiments/runner.py`), multiple clips are processed concurrently using a thread pool. Workers overlap processing across different clips — Clip A's Stage 2 runs while Clip B's Stage 1 runs — enabling pipelining that is not available in a request/response model.
+In batch processing mode, multiple clips are processed concurrently using a thread pool. Workers overlap processing across different clips — Clip A's Stage 2 runs while Clip B's Stage 1 runs — enabling pipelining that is not available in a request/response model.
 
 With 1-minute clips, each camera generates 1 clip/min. Worker concurrency in batch mode determines how many cameras can be served:
 
@@ -235,7 +229,7 @@ With 1-minute clips, each camera generates 1 clip/min. Worker concurrency in bat
 
 ### HTTP Endpoint Throughput (Measured)
 
-A FastAPI endpoint (`api/endpoint.py`) was load-tested across three scenarios: all-accident (small clip), realistic mixed workload (0.1% accident rate), and clip size sensitivity (10 MB clip). Each run used concurrency levels 1, 2, 4, 8 (12 requests per level, 2 warm-up discarded). 0 errors across all 144 requests.
+An HTTP endpoint was load-tested across three scenarios: all-accident (small clip), realistic mixed workload (0.1% accident rate), and clip size sensitivity (10 MB clip). Each run used concurrency levels 1, 2, 4, 8 (12 requests per level, 2 warm-up discarded). 0 errors across all 144 requests.
 
 #### Run 1 — All-Accident, Small Clip (VID001, 0.27 MB)
 
@@ -305,7 +299,6 @@ The realistic mixed workload (0.1% accident rate) supports 4–5× more cameras 
 
 For deployments with small clips and typical Vertex AI quota headroom, C=4 per instance is the recommended setting — it achieves near-linear throughput scaling (99% efficiency) while keeping Apdex at 0.96. Set max concurrency to 1 only if quota is constrained or clip sizes exceed 5 MB.
 
-Full load test results: `outputs/load_test_report_default.md`, `outputs/load_test_report_mixed.md`, `outputs/load_test_report_large_clip.md`.
 
 ### Multi-Camera Deployment Cost (0.1% accident rate, data centre baseline)
 

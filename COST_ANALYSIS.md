@@ -145,7 +145,7 @@ G_005 macro F1 (0.671) hides significant variance across incident types.
 **Root causes for weak classes:**
 - **Trip / Struck by Object** — visually ambiguous; high confusion with Fall and Slip. Both have n=7 samples — metric is noisy but the confusion is a real model behaviour.
 - **Fire** — n=4; small sample but the model conflates fire with other hazards.
-- **Vehicle Incident** — single mis-clipped sample (forklift tip-over never appears on screen). F1=0.000 is entirely a data quality issue, not a model weakness. See `outputs/vehicle_incident_investigation.txt`.
+- **Vehicle Incident** — single mis-clipped sample (forklift tip-over never appears on screen). F1=0.000 is entirely a data quality issue, not a model weakness.
 
 **Data centre relevance:** The weakest categories (Vehicle Incident, Trip) are less relevant in data centre environments where forklifts and trip-hazard scenarios are uncommon. The highest-priority categories for that deployment context (Electrocution, Arc Flash) are among the strongest performers.
 
