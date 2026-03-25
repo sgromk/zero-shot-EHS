@@ -1,6 +1,7 @@
 # ── Personal notes and plans (local only) ────────────────────────────────
 NOTES.md
 plans/
+EHS_REPORT_FINDINGS.md
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 .env
@@ -20,7 +21,10 @@ env/
 # ── Outputs (results land here but are not committed) ─────────────────────────
 outputs/*/
 !outputs/.gitkeep
-outputs/vehicle_incident_investigation.txt
+outputs/*.md
+outputs/*.txt
+outputs/*.json
+outputs/*.png
 
 # ── Temp video files ──────────────────────────────────────────────────────────
 ytvideos/
@@ -30,6 +34,11 @@ tmp_frames/
 
 # ── Jupyter checkpoints ───────────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+# ── Trainable model diagnostic outputs (weights, figures, executed notebook) ──
+few_shot_diagnostic/few_shot_outputs/
+few_shot_diagnostic/runner_executed.ipynb
+TRAINABLE_MODEL_FINDINGS.md
 
 # ── Data files (large; manage separately) ────────────────────────────────────
 data/videos/
